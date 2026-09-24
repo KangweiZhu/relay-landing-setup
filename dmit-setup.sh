@@ -23,6 +23,8 @@ LINKS=/root/client-links.txt
 NJ_SCRIPT=/root/nj-setup.sh
 PROXY_PORT=${PROXY_PORT:-443}
 DEFAULT_SNI=www.microsoft.com
+REPO_RAW=${REPO_RAW:-https://raw.githubusercontent.com/KangweiZhu/relay-landing-setup/main}
+SB_SUMS_FILE=/etc/dmit-relay/sing-box.sha256
 DEFAULT_NJ_HOST=ddns.kz7.site
 DEFAULT_NJ_PORT=40553
 DEFAULT_NJ_SSH_USER=root
@@ -83,7 +85,7 @@ tcp_ok() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 # ============================================================================ 两端共用
 # 下面这些函数原样嵌进家里的 nj-setup.sh（declare -f），保证两端行为一致
-SHARED_FUNCS=(apt_need has_timesvc base_deps https_date time_offset synced fix_time time_report)
+SHARED_FUNCS=(apt_need has_timesvc base_deps fetch_bin https_date time_offset synced fix_time time_report)
 
 apt_need() {  # apt_need 包...：只装缺的
   command -v apt-get >/dev/null || { fail "仅支持 Debian / Ubuntu（apt）"; exit 1; }
@@ -104,9 +106,29 @@ has_timesvc() {  # 先存下输出再 grep，避免 pipefail 下 grep -q 提前�
 }
 
 base_deps() {  # base_deps [额外的包...]：两端都要的依赖 + 额外的
-  local pk=(curl ca-certificates tar iproute2)
+  local pk=(curl ca-certificates tar gzip iproute2)
   has_timesvc || pk+=(systemd-timesyncd)   # 已有 chrony / ntp 时不装，避免互相顶掉
   apt_need "${pk[@]}" "$@"
+}
+
+fetch_bin() {  # fetch_bin 程序名 安装路径 校验表：从本仓库 bin/ 下载，sha256 对上才安装
+  local a t exp
+  case "$(uname -m)" in x86_64) a=amd64 ;; aarch64) a=arm64 ;; *) fail "不支持的架构: $(uname -m)"; exit 1 ;; esac
+  exp=$(awk -v f="$1-linux-$a.gz" '$2 == f {print $1}' "$3")
+  [[ -n $exp ]] || { fail "校验表里没有 $1-linux-$a.gz"; exit 1; }
+  t=$(mktemp -d)
+  if ! curl -fsSL -o "$t/bin.gz" "$REPO_RAW/bin/$1-linux-$a.gz"; then
+    rm -rf "$t"; fail "下载 $1 失败：$REPO_RAW/bin/$1-linux-$a.gz"; exit 1
+  fi
+  if [[ $(sha256sum "$t/bin.gz" | awk '{print $1}') != "$exp" ]]; then
+    rm -rf "$t"
+    fail "$1 的 sha256 校验失败，已中止安装"
+    fail "仓库如果刚更新过版本：稍等几分钟重试；家里中转端要先在 DMIT 上 dmit 16 更新，再 dmit 12"
+    exit 1
+  fi
+  gunzip -c "$t/bin.gz" >"$t/bin"
+  install -m 755 "$t/bin" "$2"
+  rm -rf "$t"
 }
 
 https_date() { curl -sI --max-time 5 https://www.google.com 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r'; }
@@ -133,7 +155,7 @@ fix_time() {  # 开 NTP → 偏差 > 3 秒立即校正 → NTP 不通则启用 H
     warn "无法获取标准时间（连不上 www.google.com）"
   fi
 
-  local i; for i in $(seq 1 10); do synced && break; sleep 2; done
+  local _; for _ in $(seq 1 10); do synced && break; sleep 2; done
   if synced; then
     ok "NTP 已同步"
     systemctl disable --now dmit-timesync.timer >/dev/null 2>&1 || true
@@ -178,22 +200,25 @@ time_report() {  # 状态里的时间部分；TIME_FIX_HINT 由各端自己定�
   else ok "时间偏差 ${off} 秒"; fi
 }
 
+# 从本仓库取 sing-box 的版本号和校验表；校验表存下来，生成家里脚本时一并带过去
+fetch_sb_sums() {
+  local want sums
+  want=$(curl -fsSL "$REPO_RAW/bin/versions.env" | sed -n 's/^SING_BOX_VERSION=//p') || true
+  sums=$(curl -fsSL "$REPO_RAW/bin/SHA256SUMS" | grep ' sing-box-linux-') || true
+  [[ -n $want && -n $sums ]] || die "从仓库获取 sing-box 版本信息失败：$REPO_RAW/bin/"
+  mkdir -p "${SB_SUMS_FILE%/*}"
+  printf '%s\n' "$sums" >"$SB_SUMS_FILE"
+  SB_WANT=$want
+}
+
 install_singbox() {
-  local arch latest cur tmp
-  case "$(uname -m)" in
-    x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) die "不支持的架构: $(uname -m)" ;;
-  esac
-  latest=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/^v//')
-  [[ -n $latest && $latest != null ]] || die "获取 sing-box 最新版本失败（GitHub API 可能限流，稍后再试）"
+  local cur
+  fetch_sb_sums
   cur=$(sb_ver || true)
-  if [[ $cur == "$latest" ]]; then ok "sing-box 已是最新版 v$cur"; return; fi
-  tmp=$(mktemp -d)
-  curl -fsSL -o "$tmp/sb.tgz" \
-    "https://github.com/SagerNet/sing-box/releases/download/v${latest}/sing-box-${latest}-linux-${arch}.tar.gz"
-  tar -xzf "$tmp/sb.tgz" -C "$tmp"
-  install -m 755 "$tmp/sing-box-${latest}-linux-${arch}/sing-box" "$SB_BIN"
-  rm -rf "$tmp"
-  ok "sing-box ${cur:+v$cur → }v$latest"
+  if [[ $cur == "$SB_WANT" ]]; then ok "sing-box 已是仓库里的版本 v$cur"; return; fi
+  fetch_bin sing-box "$SB_BIN" "$SB_SUMS_FILE"
+  [[ $(sb_ver) == "$SB_WANT" ]] || die "装好的 sing-box 版本不对（$(sb_ver)，应为 $SB_WANT），可能是仓库刚更新，稍后重试"
+  ok "sing-box ${cur:+v$cur → }v$SB_WANT ${D}（本仓库构建，sha256 已校验）${N}"
 }
 
 check_sni() {
@@ -390,15 +415,19 @@ apply() {
 # ============================================================================ 家里中转端脚本
 write_nj_script() {
   load; nj_on || { rm -f "$NJ_SCRIPT"; return 0; }
+  [[ -s $SB_SUMS_FILE ]] || fetch_sb_sums
   umask 077
   {
     echo '#!/usr/bin/env bash'
+    echo '# shellcheck disable=SC2120  # 共用函数 base_deps 只有 DMIT 端会带参数'
     echo '# 新泽西家里的中转端（DMIT 线路 3 专用，独立的 Shadowsocks-2022 服务，不影响家里的 Hy2）'
     echo '#   sudo bash nj-setup.sh            安装 / 重装'
     echo '#   sudo bash nj-setup.sh status     状态：服务、端口、时间同步、公网 IP 与 DDNS'
     echo '#   sudo bash nj-setup.sh time       只修正时间同步'
     echo '#   sudo bash nj-setup.sh uninstall  卸载'
-    printf 'NJ_HOST=%q\nNJ_PORT=%q\nNJ_SS_KEY=%q\nSB_VER=%q\n' "$NJ_HOST" "$NJ_PORT" "$NJ_SS_KEY" "$(sb_ver)"
+    printf 'NJ_HOST=%q\nNJ_PORT=%q\nNJ_SS_KEY=%q\nSB_VER=%q\nREPO_RAW=%q\n' \
+      "$NJ_HOST" "$NJ_PORT" "$NJ_SS_KEY" "$(sb_ver)" "$REPO_RAW"
+    printf 'SB_SUMS=%q\n' "$(cat "$SB_SUMS_FILE")"   # 和 DMIT 装的是同一份 sing-box
     cat <<'NJEOF'
 set -euo pipefail
 DIR=/usr/local/lib/dmit-relay
@@ -433,13 +462,10 @@ install_relay() {
   section "依赖"
   base_deps
   section "安装 sing-box"
-  local A T
-  case "$(uname -m)" in x86_64) A=amd64 ;; aarch64) A=arm64 ;; *) fail "不支持的架构"; exit 1 ;; esac
-  mkdir -p "$DIR"; T=$(mktemp -d)
-  curl -fsSL -o "$T/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-$A.tar.gz"
-  tar -xzf "$T/sb.tgz" -C "$T"
-  install -m 755 "$T/sing-box-${SB_VER}-linux-$A/sing-box" "$DIR/sing-box"; rm -rf "$T"
-  ok "sing-box v${SB_VER}（装在 $DIR，不影响系统里其他 sing-box）"
+  mkdir -p "$DIR"
+  printf '%s\n' "$SB_SUMS" >"$DIR/sing-box.sha256"
+  fetch_bin sing-box "$DIR/sing-box" "$DIR/sing-box.sha256"
+  ok "sing-box v${SB_VER}（本仓库构建，sha256 已校验；装在 $DIR，不影响系统里其他 sing-box）"
 
   section "配置中转服务"
   cat >"$DIR/config.json" <<CONF
@@ -553,7 +579,7 @@ show_links() {
   link_block 3 "3-dmit-to-nj"   "国内 → DMIT → 新泽西"     "家宽" "$L3"
   echo; printf '  %s  %s\n' "${D}线路 4  家里 Hy2${N}" "${D}你现有的节点，不受本脚本影响${N}"
   echo
-  info "线路 1 和 3 只差开头的 UUID；导入 Hy2 时确认混淆 salamander 和“跳过证书验证”都在"
+  info "线路 1 和 3 只差开头的 UUID；导入 Hy2 时确认混淆 salamander 和「跳过证书验证」都在"
 }
 
 show_qr() {
@@ -571,7 +597,7 @@ nj_hint() {
   load
   nj_on || { warn "线路 3 未配置，先运行 ./dmit-setup.sh 9"; return 0; }
   [[ -f $NJ_SCRIPT ]] || write_nj_script >/dev/null
-  local t="$(ssh_user)@${NJ_HOST}"
+  local t; t="$(ssh_user)@${NJ_HOST}"
   section "家里中转端：手动安装步骤 ${D}（或直接用 ./dmit-setup.sh 12 一键完成）${N}"
   kv "① 拷过去" "scp -P $(ssh_port) ${NJ_SCRIPT} ${t}:~/"
   kv "② 去安装" "ssh -t -p $(ssh_port) ${t} '$(remote_run)'"
@@ -585,7 +611,7 @@ nj_hint() {
 cmd_install() {
   need_root; banner
   local n=6
-  step 1 $n "安装依赖";       base_deps jq openssl qrencode openssh-client
+  step 1 $n "安装依赖";       base_deps openssl qrencode openssh-client
   step 2 $n "安装 sing-box";  install_singbox
   step 3 $n "密钥与参数";     init_secrets; nj_prompt; check_sni "$SNI"; detect_ip
   step 4 $n "系统优化与对时"; enable_bbr; fix_time
