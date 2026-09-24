@@ -29,7 +29,6 @@ DEFAULT_NJ_SSH_USER=root
 DEFAULT_NJ_SSH_PORT=40550
 MENU_MODE=0
 TIME_FIX_HINT="./dmit-setup.sh time"
-SSH_CTL=
 
 # ============================================================================ 样式
 if [[ -t 1 ]]; then
@@ -79,22 +78,6 @@ badge()  {
 install_self() {
   local src; src=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || true)
   if [[ -f $src && $src != "$SELF" ]]; then install -m 755 "$src" "$SELF"; fi
-}
-# SSH 到家里：nj_open 建一条共享连接（只输一次密码），之后的 nj_ssh 都复用它
-nj_ssh() {
-  local o=(-p "$(ssh_port)" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
-  [[ -n $SSH_CTL ]] && o+=(-o "ControlPath=$SSH_CTL")
-  ssh "${o[@]}" "$@"
-}
-nj_open() {
-  SSH_CTL=$(mktemp -d)/ctl
-  trap nj_close EXIT
-  nj_ssh -o ControlMaster=yes -o ControlPersist=600 -fN "$(ssh_user)@${NJ_HOST}"
-}
-nj_close() {
-  [[ -n $SSH_CTL ]] || return 0
-  ssh -o ControlPath="$SSH_CTL" -O exit "$(ssh_user)@${NJ_HOST}" >/dev/null 2>&1 || true
-  rm -rf "${SSH_CTL%/*}"; SSH_CTL=
 }
 tcp_ok() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
@@ -741,15 +724,12 @@ cmd_nj_push() {
   section "一键部署家里中转端"
   kv "目标" "$t  ${D}SSH 端口 $(ssh_port)${N}"
   write_nj_script >/dev/null
-  info "输入一次家里机器的 SSH 密码即可，后面的拷贝和安装都复用这条连接"
-  nj_open || die "SSH 连不上：检查家里 SSH 用户名 / 端口 / 密码（./dmit-setup.sh 9 可修改）"
-  ok "已连上家里"
-  nj_ssh "$t" 'umask 077; cat > ~/nj-setup.sh' <"$NJ_SCRIPT" \
-    || { nj_close; die "拷贝失败"; }
+  info "接下来需要输入家里机器的 SSH 密码（拷贝一次、安装一次）"
+  scp -q -P "$(ssh_port)" -o ConnectTimeout=10 "$NJ_SCRIPT" "${t}:~/nj-setup.sh" \
+    || die "拷贝失败：检查家里 SSH 用户名 / 端口（./dmit-setup.sh 9 可修改）"
   ok "脚本已拷到家里"
-  nj_ssh -t "$t" "$(remote_run) install" \
-    || { nj_close; die "家里执行失败，看上面的输出"; }
-  nj_close
+  ssh -t -p "$(ssh_port)" -o ConnectTimeout=10 "$t" "$(remote_run) install" \
+    || die "家里执行失败，看上面的输出"
   section "回到 DMIT 验证"
   if tcp_ok "$NJ_HOST" "$NJ_PORT"; then ok "DMIT → 新泽西 $NJ_PORT/tcp 可达，线路 3 可以用了"
   else fail "DMIT 仍连不上 $NJ_HOST:$NJ_PORT → 检查路由器是否把 $NJ_PORT 的 TCP+UDP 转发到这台机器"; fi
@@ -758,7 +738,7 @@ cmd_nj_push() {
 cmd_nj_status() {
   need_root; need_installed; load
   nj_on || { warn "线路 3 还没配置，先运行 ./dmit-setup.sh 9"; return 0; }
-  nj_ssh -t "$(ssh_user)@${NJ_HOST}" "$(remote_run) status" \
+  ssh -t -p "$(ssh_port)" -o ConnectTimeout=10 "$(ssh_user)@${NJ_HOST}" "$(remote_run) status" \
     || warn "获取失败：家里还没部署新版中转端的话，先 ./dmit-setup.sh 12"
 }
 
