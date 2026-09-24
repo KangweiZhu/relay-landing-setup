@@ -28,6 +28,8 @@ DEFAULT_NJ_PORT=40553
 DEFAULT_NJ_SSH_USER=root
 DEFAULT_NJ_SSH_PORT=40550
 MENU_MODE=0
+TIME_FIX_HINT="./dmit-setup.sh time"
+SSH_CTL=
 
 # ============================================================================ 样式
 if [[ -t 1 ]]; then
@@ -78,14 +80,119 @@ install_self() {
   local src; src=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || true)
   if [[ -f $src && $src != "$SELF" ]]; then install -m 755 "$src" "$SELF"; fi
 }
+# SSH 到家里：nj_open 建一条共享连接（只输一次密码），之后的 nj_ssh 都复用它
+nj_ssh() {
+  local o=(-p "$(ssh_port)" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+  [[ -n $SSH_CTL ]] && o+=(-o "ControlPath=$SSH_CTL")
+  ssh "${o[@]}" "$@"
+}
+nj_open() {
+  SSH_CTL=$(mktemp -d)/ctl
+  trap nj_close EXIT
+  nj_ssh -o ControlMaster=yes -o ControlPersist=600 -fN "$(ssh_user)@${NJ_HOST}"
+}
+nj_close() {
+  [[ -n $SSH_CTL ]] || return 0
+  ssh -o ControlPath="$SSH_CTL" -O exit "$(ssh_user)@${NJ_HOST}" >/dev/null 2>&1 || true
+  rm -rf "${SSH_CTL%/*}"; SSH_CTL=
+}
 tcp_ok() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
-install_deps() {
-  command -v apt-get >/dev/null || die "仅支持 Debian / Ubuntu"
+# ============================================================================ 两端共用
+# 下面这些函数原样嵌进家里的 nj-setup.sh（declare -f），保证两端行为一致
+SHARED_FUNCS=(apt_need has_timesvc base_deps https_date time_offset synced fix_time time_report)
+
+apt_need() {  # apt_need 包...：只装缺的
+  command -v apt-get >/dev/null || { fail "仅支持 Debian / Ubuntu（apt）"; exit 1; }
+  local p miss=()
+  for p in "$@"; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed' || miss+=("$p")
+  done
+  if ((${#miss[@]} == 0)); then ok "依赖齐全"; return 0; fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq curl jq openssl tar iproute2 qrencode openssh-client >/dev/null
-  ok "curl jq openssl qrencode ssh 等依赖已就绪"
+  apt-get install -y -qq "${miss[@]}" >/dev/null
+  ok "已补装：${miss[*]}"
+}
+
+has_timesvc() {  # 先存下输出再 grep，避免 pipefail 下 grep -q 提前退出造成误判
+  local u; u=$(systemctl list-unit-files 2>/dev/null || true)
+  grep -qE '^(systemd-timesyncd|chrony|chronyd|ntp|ntpsec)\.service' <<<"$u"
+}
+
+base_deps() {  # base_deps [额外的包...]：两端都要的依赖 + 额外的
+  local pk=(curl ca-certificates tar iproute2)
+  has_timesvc || pk+=(systemd-timesyncd)   # 已有 chrony / ntp 时不装，避免互相顶掉
+  apt_need "${pk[@]}" "$@"
+}
+
+https_date() { curl -sI --max-time 5 https://www.google.com 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r'; }
+
+time_offset() {  # 与 HTTPS 时间的偏差（秒，本机减标准）
+  local h r; h=$(https_date); [[ -n $h ]] || return 1
+  r=$(date -d "$h" +%s 2>/dev/null) || return 1
+  echo $(( $(date +%s) - r ))
+}
+
+synced() { [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; }
+
+fix_time() {  # 开 NTP → 偏差 > 3 秒立即校正 → NTP 不通则启用 HTTPS 校时兜底
+  local ts_dir=/usr/local/lib/dmit-relay
+  timedatectl set-ntp true 2>/dev/null || true
+
+  local off; off=$(time_offset || true)
+  if [[ -n $off ]] && (( ${off#-} > 3 )); then
+    if date -s "$(https_date)" >/dev/null 2>&1; then ok "时间偏差 ${off} 秒，已立即校正"
+    else fail "无法修改系统时间（容器环境？需要在宿主机上开启对时）"; fi
+  elif [[ -n $off ]]; then
+    ok "当前时间偏差 ${off} 秒"
+  else
+    warn "无法获取标准时间（连不上 www.google.com）"
+  fi
+
+  local i; for i in $(seq 1 10); do synced && break; sleep 2; done
+  if synced; then
+    ok "NTP 已同步"
+    systemctl disable --now dmit-timesync.timer >/dev/null 2>&1 || true
+  else
+    warn "NTP 未能同步（可能 UDP 123 被挡），启用 HTTPS 校时兜底：每 10 分钟一次"
+    mkdir -p "$ts_dir"
+    cat >"$ts_dir/https-timesync.sh" <<'EOT'
+#!/bin/sh
+h=$(curl -sI --max-time 5 https://www.google.com | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')
+[ -n "$h" ] && date -s "$h" >/dev/null
+EOT
+    chmod 755 "$ts_dir/https-timesync.sh"
+    cat >/etc/systemd/system/dmit-timesync.service <<EOT
+[Unit]
+Description=HTTPS time sync fallback for DMIT relay
+[Service]
+Type=oneshot
+ExecStart=$ts_dir/https-timesync.sh
+EOT
+    cat >/etc/systemd/system/dmit-timesync.timer <<'EOT'
+[Unit]
+Description=Run HTTPS time sync every 10 minutes
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=10min
+[Install]
+WantedBy=timers.target
+EOT
+    systemctl daemon-reload
+    systemctl enable --now dmit-timesync.timer >/dev/null 2>&1
+    ok "HTTPS 校时已启用"
+  fi
+}
+
+time_report() {  # 状态里的时间部分；TIME_FIX_HINT 由各端自己定义
+  local off; off=$(time_offset || true)
+  if synced; then ok "NTP 已同步"
+  elif systemctl is-active --quiet dmit-timesync.timer 2>/dev/null; then ok "HTTPS 校时兜底运行中"
+  else warn "NTP 未同步 → $TIME_FIX_HINT"; fi
+  if [[ -z $off ]]; then warn "无法获取标准时间"
+  elif (( ${off#-} > 30 )); then fail "时间偏差 ${off} 秒，超过 30 秒，线路 3 会被拒绝 → $TIME_FIX_HINT"
+  else ok "时间偏差 ${off} 秒"; fi
 }
 
 install_singbox() {
@@ -129,24 +236,6 @@ net.ipv4.tcp_congestion_control=bbr
 EOF
   sysctl --system >/dev/null
   ok "BBR 已开启（当前：$(sysctl -n net.ipv4.tcp_congestion_control)）"
-}
-
-# 与 HTTPS 时间的偏差（秒，本机减标准）
-time_offset() {
-  local h r
-  h=$(curl -sI --max-time 5 https://www.google.com 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')
-  [[ -n $h ]] || return 1
-  r=$(date -d "$h" +%s 2>/dev/null) || return 1
-  echo $(( $(date +%s) - r ))
-}
-
-ensure_time() {
-  if ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chrony|chronyd|ntp|ntpsec)\.service'; then
-    apt-get install -y -qq systemd-timesyncd >/dev/null 2>&1 || true
-  fi
-  timedatectl set-ntp true 2>/dev/null || true
-  local s; s=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "?")
-  [[ $s == yes ]] && ok "NTP 对时已开启并同步" || warn "NTP 已开启，正在同步中（线路 3 要求两端时间误差 < 30 秒）"
 }
 
 # ============================================================================ 密钥
@@ -342,69 +431,24 @@ kv()      { printf '  %s  %s\n' "${D}$1${N}" "$2"; }
 section() { echo; printf '%s\n' "${B}${C}▸ $*${N}"; }
 banner()  { echo; printf '  %s  %s\n' "${C}${B}▌ DMIT Relay · 家里中转端${N}" "${D}端口 ${NJ_PORT} · SS2022${N}"; printf '%s\n' "${D}──────────────────────────────────────────────────────────────${N}"; }
 [[ $EUID -eq 0 ]] || { echo "请用 root 运行"; exit 1; }
+TIME_FIX_HINT="sudo bash nj-setup.sh time"
 
-https_date() { curl -sI --max-time 5 https://www.google.com 2>/dev/null | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r'; }
-time_offset() {
-  local h r; h=$(https_date); [[ -n $h ]] || return 1
-  r=$(date -d "$h" +%s 2>/dev/null) || return 1
-  echo $(( $(date +%s) - r ))
-}
-synced() { [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; }
+# ---- 以下与 DMIT 端共用（由 dmit-setup.sh 原样嵌入）----
+NJEOF
+    declare -f "${SHARED_FUNCS[@]}"
+    cat <<'NJEOF'
+# ---- 共用部分结束 ----
 
-fix_time() {
+do_time() {
   section "时间同步 ${D}（SS2022 要求两端误差 < 30 秒）${N}"
-  if command -v apt-get >/dev/null && \
-     ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chrony|chronyd|ntp|ntpsec)\.service'; then
-    apt-get install -y -qq systemd-timesyncd >/dev/null 2>&1 || true
-  fi
-  timedatectl set-ntp true 2>/dev/null || true
-
-  local off; off=$(time_offset || true)
-  if [[ -n $off ]] && (( ${off#-} > 3 )); then
-    if date -s "$(https_date)" >/dev/null 2>&1; then ok "时间偏差 ${off} 秒，已立即校正"
-    else fail "无法修改系统时间（容器环境？需要在宿主机上开启对时）"; fi
-  elif [[ -n $off ]]; then
-    ok "当前时间偏差 ${off} 秒"
-  fi
-
-  local i; for i in $(seq 1 10); do synced && break; sleep 2; done
-  if synced; then
-    ok "NTP 已同步"
-    systemctl disable --now dmit-timesync.timer >/dev/null 2>&1 || true
-  else
-    warn "NTP 未能同步（可能 UDP 123 被挡），启用 HTTPS 校时兜底：每 10 分钟一次"
-    mkdir -p "$DIR"
-    cat >"$DIR/https-timesync.sh" <<'EOT'
-#!/bin/sh
-h=$(curl -sI --max-time 5 https://www.google.com | awk -F': ' 'tolower($1)=="date"{print $2}' | tr -d '\r')
-[ -n "$h" ] && date -s "$h" >/dev/null
-EOT
-    chmod 755 "$DIR/https-timesync.sh"
-    cat >/etc/systemd/system/dmit-timesync.service <<EOT
-[Unit]
-Description=HTTPS time sync fallback for DMIT relay
-[Service]
-Type=oneshot
-ExecStart=$DIR/https-timesync.sh
-EOT
-    cat >/etc/systemd/system/dmit-timesync.timer <<'EOT'
-[Unit]
-Description=Run HTTPS time sync every 10 minutes
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=10min
-[Install]
-WantedBy=timers.target
-EOT
-    systemctl daemon-reload
-    systemctl enable --now dmit-timesync.timer >/dev/null 2>&1
-    ok "HTTPS 校时已启用"
-  fi
+  base_deps
+  fix_time
 }
 
 install_relay() {
   banner
-  command -v curl >/dev/null && command -v tar >/dev/null || { fail "请先安装 curl 和 tar"; exit 1; }
+  section "依赖"
+  base_deps
   section "安装 sing-box"
   local A T
   case "$(uname -m)" in x86_64) A=amd64 ;; aarch64) A=arm64 ;; *) fail "不支持的架构"; exit 1 ;; esac
@@ -452,7 +496,7 @@ UNIT
   if systemctl is-active --quiet dmit-relay; then ok "中转服务运行中"
   else fail "启动失败：journalctl -u dmit-relay -e"; exit 1; fi
 
-  fix_time
+  do_time
   status_relay nobanner
 }
 
@@ -464,11 +508,7 @@ status_relay() {
   ss -Hlnup "sport = :${NJ_PORT}" 2>/dev/null | grep -q sing-box && ok "UDP ${NJ_PORT} 监听中" || fail "UDP ${NJ_PORT} 未监听"
 
   section "时间"
-  local off; off=$(time_offset || true)
-  synced && ok "NTP 已同步" || { systemctl is-active --quiet dmit-timesync.timer && ok "HTTPS 校时兜底运行中" || warn "NTP 未同步 → sudo bash nj-setup.sh time"; }
-  if [[ -z $off ]]; then warn "无法获取标准时间"
-  elif (( ${off#-} > 30 )); then fail "时间偏差 ${off} 秒，超过 30 秒，线路 3 会被拒绝 → sudo bash nj-setup.sh time"
-  else ok "时间偏差 ${off} 秒"; fi
+  time_report
 
   section "网络"
   local ip dns
@@ -491,7 +531,7 @@ uninstall_relay() {
 case ${1:-install} in
   install)   install_relay ;;
   status)    status_relay ;;
-  time)      fix_time ;;
+  time)      do_time ;;
   uninstall) uninstall_relay ;;
   *)         echo "用法：sudo bash nj-setup.sh [install|status|time|uninstall]"; exit 1 ;;
 esac
@@ -562,10 +602,10 @@ nj_hint() {
 cmd_install() {
   need_root; banner
   local n=6
-  step 1 $n "安装依赖";       install_deps
+  step 1 $n "安装依赖";       base_deps jq openssl qrencode openssh-client
   step 2 $n "安装 sing-box";  install_singbox
   step 3 $n "密钥与参数";     init_secrets; nj_prompt; check_sni "$SNI"; detect_ip
-  step 4 $n "系统优化";       enable_bbr; ensure_time
+  step 4 $n "系统优化与对时"; enable_bbr; fix_time
   step 5 $n "生成配置并启动"; write_service; apply; write_nj_script
   step 6 $n "安装管理命令";   install_self; ok "以后可以用 ${B}dmit${N} 代替 ./dmit-setup.sh"
   show_links
@@ -574,7 +614,7 @@ cmd_install() {
     echo
     if tcp_ok "$NJ_HOST" "$NJ_PORT"; then
       ok "家里中转端已在线（$NJ_HOST:$NJ_PORT）"
-      info "如果家里用的是旧版中转端，建议用 ./dmit-setup.sh 12 更新一次（带自动对时）"
+      info "如果家里用的是旧版中转端，建议用 ./dmit-setup.sh 12 更新一次（带自动补依赖和对时）"
     else
       warn "家里中转端还不可达 → ./dmit-setup.sh 12 一键部署"
     fi
@@ -595,9 +635,9 @@ cmd_status() {
     ss -Hlnup "sport = :${PROXY_PORT}" 2>/dev/null | grep -q sing-box && ok "UDP ${PROXY_PORT} 监听中（Hysteria2）" || fail "UDP ${PROXY_PORT} 未监听"
   fi
   [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr ]] && ok "BBR 已启用" || warn "BBR 未启用"
-  local off; off=$(time_offset || true)
-  if [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; then ok "NTP 已同步 ${D}(偏差 ${off:-?} 秒)${N}"
-  else warn "NTP 未同步 ${D}(偏差 ${off:-?} 秒)${N} → ./dmit-setup.sh 15 重新部署会自动开启"; fi
+
+  section "时间"
+  time_report
 
   section "线路"
   kv "线路 1" "$(badge 1)  ${D}国内 → DMIT（Reality）${N}"
@@ -626,6 +666,13 @@ cmd_status() {
   kv "入站" "$(numfmt --to=iec --suffix=B "$rx")"
   kv "出站" "$(numfmt --to=iec --suffix=B "$tx")"
   kv "合计" "${B}$(numfmt --to=iec --suffix=B $((rx + tx)))${N}  ${D}月额度 1000GB · 准确用量以 DMIT 面板为准${N}"
+}
+
+cmd_time() {
+  need_root
+  section "时间同步 ${D}（SS2022 要求两端误差 < 30 秒）${N}"
+  base_deps
+  fix_time
 }
 
 cmd_log() { need_installed; section "最近 50 行日志"; journalctl -u sing-box -n 50 --no-pager; }
@@ -694,12 +741,15 @@ cmd_nj_push() {
   section "一键部署家里中转端"
   kv "目标" "$t  ${D}SSH 端口 $(ssh_port)${N}"
   write_nj_script >/dev/null
-  info "接下来可能需要输入家里机器的 SSH 密码（最多两次）"
-  scp -q -P "$(ssh_port)" -o ConnectTimeout=10 "$NJ_SCRIPT" "${t}:~/nj-setup.sh" \
-    || die "拷贝失败：检查家里 SSH 用户名 / 端口（./dmit-setup.sh 9 可修改）"
+  info "输入一次家里机器的 SSH 密码即可，后面的拷贝和安装都复用这条连接"
+  nj_open || die "SSH 连不上：检查家里 SSH 用户名 / 端口 / 密码（./dmit-setup.sh 9 可修改）"
+  ok "已连上家里"
+  nj_ssh "$t" 'umask 077; cat > ~/nj-setup.sh' <"$NJ_SCRIPT" \
+    || { nj_close; die "拷贝失败"; }
   ok "脚本已拷到家里"
-  ssh -t -p "$(ssh_port)" -o ConnectTimeout=10 "$t" "$(remote_run) install" \
-    || die "家里执行失败，看上面的输出"
+  nj_ssh -t "$t" "$(remote_run) install" \
+    || { nj_close; die "家里执行失败，看上面的输出"; }
+  nj_close
   section "回到 DMIT 验证"
   if tcp_ok "$NJ_HOST" "$NJ_PORT"; then ok "DMIT → 新泽西 $NJ_PORT/tcp 可达，线路 3 可以用了"
   else fail "DMIT 仍连不上 $NJ_HOST:$NJ_PORT → 检查路由器是否把 $NJ_PORT 的 TCP+UDP 转发到这台机器"; fi
@@ -708,7 +758,7 @@ cmd_nj_push() {
 cmd_nj_status() {
   need_root; need_installed; load
   nj_on || { warn "线路 3 还没配置，先运行 ./dmit-setup.sh 9"; return 0; }
-  ssh -t -p "$(ssh_port)" -o ConnectTimeout=10 "$(ssh_user)@${NJ_HOST}" "$(remote_run) status" \
+  nj_ssh -t "$(ssh_user)@${NJ_HOST}" "$(remote_run) status" \
     || warn "获取失败：家里还没部署新版中转端的话，先 ./dmit-setup.sh 12"
 }
 
@@ -752,11 +802,12 @@ cmd_uninstall() {
   need_root
   warn "将删除 sing-box、全部配置、密钥和 dmit 命令"
   confirm "确定卸载吗" || return 0
-  systemctl disable --now sing-box 2>/dev/null || true
+  systemctl disable --now sing-box dmit-timesync.timer 2>/dev/null || true
   rm -rf "$SB_DIR" "$STATE_DIR" /etc/systemd/system/sing-box.service /etc/sysctl.d/99-dmit-relay.conf \
+         /usr/local/lib/dmit-relay /etc/systemd/system/dmit-timesync.service /etc/systemd/system/dmit-timesync.timer \
          "$SB_BIN" "$LINKS" "$NJ_SCRIPT" "$SELF"
   systemctl daemon-reload
-  ok "已卸载 ${D}（家里的中转端：bash nj-setup.sh uninstall）${N}"
+  ok "已卸载 ${D}（NTP 对时保留；家里的中转端：bash nj-setup.sh uninstall）${N}"
   ((MENU_MODE)) && exit 0
   return 0
 }
@@ -806,6 +857,7 @@ cmd_help() {
     ${C}18${N} uninstall     卸载
     ${C}19${N} files         文件位置
     ${C}20${N} help          本帮助
+    ${C}21${N} time          立即对时（NTP + HTTPS 兜底，家里是 nj-setup.sh time）
 EOF
 }
 
@@ -832,6 +884,7 @@ run() {
     18|uninstall)   cmd_uninstall ;;
     19|files)       cmd_files ;;
     20|help|-h|--help) cmd_help ;;
+    21|time)        cmd_time ;;
     *)              cmd_help; return 1 ;;
   esac
 }
@@ -871,6 +924,7 @@ menu_body() {
     ${C}17${N}  重新生成全部密钥          ${C}18${N}  卸载
 
     ${C}19${N}  文件位置                  ${C}20${N}  命令行用法
+    ${C}21${N}  立即对时
     ${C} 0${N}  退出
 EOF
   hr
@@ -884,7 +938,7 @@ cmd_menu() {
   local c
   while true; do
     menu_header; menu_body
-    read -rp "  ${M}?${N} 选择 [0-20]: " c
+    read -rp "  ${M}?${N} 选择 [0-21]: " c
     case $c in
       0|q|"") echo; exit 0 ;;
       *) run "$c" || true ;;
