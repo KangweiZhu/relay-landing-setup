@@ -1,0 +1,55 @@
+name: 更新构建产物
+
+# 手动触发或每周一次：从上游源码构建 sing-box / hysteria，测试通过后提交到 bin/
+on:
+  workflow_dispatch:
+    inputs:
+      sing_box_version:
+        description: "sing-box 版本（如 1.14.2，留空为最新正式版）"
+        required: false
+      hysteria_version:
+        description: "hysteria 版本（如 2.12.3，留空为最新正式版）"
+        required: false
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-bins
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: 构建
+        env:
+          SB: ${{ inputs.sing_box_version }}
+          HY: ${{ inputs.hysteria_version }}
+        run: |
+          if [[ -n $SB || -n $HY ]]; then
+            source bin/versions.env
+            scripts/build-bins.sh "${SB:-$SING_BOX_VERSION}" "${HY:-$HYSTERIA_VERSION}"
+          else
+            scripts/build-bins.sh latest
+          fi
+      - name: 用新产物跑测试
+        run: tests/test-setup.sh
+      - name: 有变化就提交
+        run: |
+          if git diff --quiet -- bin/; then
+            echo "产物没有变化，不提交"; exit 0
+          fi
+          source bin/versions.env
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bin/
+          git commit -m "Update binaries: sing-box $SING_BOX_VERSION, hysteria $HYSTERIA_VERSION"
+          git push

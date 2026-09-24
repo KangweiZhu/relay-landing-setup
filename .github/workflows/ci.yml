@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: 语法检查
+        run: for f in dmit-setup.sh ddns/*.sh scripts/*.sh tests/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck -S warning dmit-setup.sh ddns/*.sh scripts/*.sh tests/*.sh
+      - name: actionlint（检查 workflow 本身）
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  test:
+    name: 测试（${{ matrix.runner }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两个架构都跑，bin/ 里的 amd64 和 arm64 产物各自真正执行一遍
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装脚本（配置用 sing-box check 校验）
+        run: tests/test-setup.sh
+      - name: DDNS 脚本（假 Cloudflare）
+        run: tests/test-ddns.sh
+
+  deps:
+    name: apt 补依赖（${{ matrix.image }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "debian:13", "ubuntu:22.04", "ubuntu:24.04"]
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: 空白系统上补齐两端依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1090
+          source <(head -n -1 dmit-setup.sh)
+          base_deps openssl qrencode openssh-client
+          for c in curl tar gzip ss openssl qrencode ssh sha256sum timedatectl; do
+            command -v "$c" >/dev/null || { echo "缺少 $c"; exit 1; }
+          done
+      - name: 再跑一次应当什么都不装
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1090
+          source <(head -n -1 dmit-setup.sh)
+          out=$(base_deps openssl qrencode openssh-client)
+          echo "$out"
+          grep -q "依赖齐全" <<<"$out"
